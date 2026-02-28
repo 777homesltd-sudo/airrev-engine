@@ -25,7 +25,7 @@ FastAPI · CREA DDF · Supabase · Railway-ready
 cd airrev-engine
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+RUN python -m pip install -r requirements.txt
 
 # 2. Configure environment
 cp .env.example .env
