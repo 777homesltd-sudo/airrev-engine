@@ -51,11 +51,29 @@ async def analyze_listing(
     if request.purchase_price_override:
         property_details.list_price = request.purchase_price_override
 
+    # Geocode if we are missing coordinates (for new/unknown neighborhoods)
+    if not property_details.latitude or not property_details.longitude:
+        try:
+            # Assume you have some maps_service or geocoder to use
+            from app.services.maps_service import maps_service
+            # Compose address string from street address/city from property_details
+            address = f"{getattr(property_details, 'address', '')}, {getattr(property_details, 'city', '')}"
+            location = await maps_service.geocode(address)
+            if location and "lat" in location and "lng" in location:
+                property_details.latitude = location["lat"]
+                property_details.longitude = location["lng"]
+        except Exception as e:
+            # Optionally log the error here if you want
+            property_details.latitude = None
+            property_details.longitude = None
+
     # 2. LAYER 1: Check Supabase Cache First (use 1km)
-    existing_comps = await supabase.get_nearby_airbnb_comps(
-        lat=property_details.latitude,
-        lng=property_details.longitude
-    )
+    existing_comps = []
+    if property_details.latitude and property_details.longitude:
+        existing_comps = await supabase.get_nearby_airbnb_comps(
+            lat=property_details.latitude,
+            lng=property_details.longitude
+        )
 
     # 3. LAYER 2 & 3: Background Refresh Logic
     should_refresh = not existing_comps or is_stale(
