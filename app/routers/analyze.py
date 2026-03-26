@@ -5,7 +5,6 @@ POST /analyze/listing  — The core AirRev Engine endpoint
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from app.core.security import require_api_key
-from app.core.cache import cache, analyze_limiter, rate_limit_check
 from app.models.schemas import (
     AnalyzeListingRequest,
     AnalyzeListingResponse,
@@ -13,32 +12,34 @@ from app.models.schemas import (
 )
 from app.services.ddf_service import ddf_service
 from app.services.calculator_service import calculator
-from app.services.rent_service import rent_service
 from app.services.supabase_service import supabase
-from app.services.str_comp_service import str_comp_service
 
 router = APIRouter()
+
+from datetime import datetime, timedelta, timezone
+
+def is_stale(last_scraped):
+    if not last_scraped:
+        return True
+    # last_scraped expected as ISO string or datetime
+    if isinstance(last_scraped, str):
+        try:
+            scraped_time = datetime.fromisoformat(last_scraped)
+        except Exception:
+            return True
+    else:
+        scraped_time = last_scraped
+    now = datetime.now(timezone.utc)
+    return scraped_time < now - timedelta(days=7)
 
 
 @router.post("/listing", response_model=AnalyzeListingResponse)
 async def analyze_listing(
     request: AnalyzeListingRequest,
-    background_tasks: BackgroundTasks,
-    http_request: Request = None,
+    background_tasks: BackgroundTasks,  # Magic key: for async refresh trigger
     _: bool = Depends(require_api_key),
 ):
-    # Rate limiting
-    if http_request:
-        await rate_limit_check(http_request, analyze_limiter)
-
-    # Cache check — skip DDF + recalculation if recently analyzed
-    cache_key = (request.mls_number, request.analysis_type.value,
-                 str(request.purchase_price_override), str(request.interest_rate))
-    cached_result = cache.get(*cache_key)
-    if cached_result:
-        return cached_result
-
-    # ── Step 1: Fetch listing from DDF ──────────────────────────────
+    # 1. Fetch property details from DDF
     raw_listing = await ddf_service.get_listing_by_mls(request.mls_number)
     if not raw_listing:
         raise HTTPException(
@@ -46,212 +47,36 @@ async def analyze_listing(
             detail=f"MLS® {request.mls_number} not found in DDF feed. "
                    f"Verify the listing is active and accessible via your DDF credentials.",
         )
-
     property_details = ddf_service.parse_property_details(raw_listing)
     if request.purchase_price_override:
         property_details.list_price = request.purchase_price_override
 
-    # ── Step 2: Mortgage ────────────────────────────────────────────
-    mortgage = calculator.calculate_mortgage(
-        purchase_price=property_details.list_price,
-        interest_rate=request.interest_rate,
-        down_payment_pct=request.down_payment_pct,
-        amortization_years=request.amortization_years,
+    # 2. LAYER 1: Check Supabase Cache First (use 1km)
+    existing_comps = await supabase.get_nearby_airbnb_comps(
+        lat=property_details.latitude,
+        lng=property_details.longitude
     )
 
-    # ── Step 3: Rent Estimates ──────────────────────────────────────
-    rent_insight = rent_service.get_rent_estimate(
-        community=property_details.community,
-        bedrooms=property_details.bedrooms,
-        property_type=property_details.property_type,
-        square_footage=property_details.square_footage,
+    # 3. LAYER 2 & 3: Background Refresh Logic
+    should_refresh = not existing_comps or is_stale(
+        getattr(existing_comps[0], "last_scraped", None)
+        if existing_comps else None
     )
-    monthly_rent = request.monthly_rent_override or rent_insight.avg_rent
-    # STR nightly rate estimate: monthly / 30 * premium multiplier
-    baseline_nightly_rate = round((monthly_rent / 30) * 2.1, 2)
-    nightly_rate = request.nightly_rate_override or baseline_nightly_rate
-
-    # ── Step 4: LTR Analysis ────────────────────────────────────────
-    ltr_analysis = None
-    if request.analysis_type in (AnalysisType.LTR, AnalysisType.BOTH):
-        ltr_analysis = calculator.calculate_ltr(
-            property=property_details,
-            mortgage=mortgage,
-            monthly_rent=monthly_rent,
+    if should_refresh and property_details.latitude and property_details.longitude:
+        background_tasks.add_task(
+            supabase.invoke_edge_function,
+            "analyze-str-v2",
+            {"lat": property_details.latitude, "lng": property_details.longitude}
         )
 
-    # ── Step 5: STR Analysis — 3-layer strategy ─────────────────────
-    str_analysis = None
-    str_comps = None
-    use_baseline = True
+    # 4. Immediate Response: calculate STR and dummy response
+    str_analysis = calculator.calculate_str(existing_comps or [])
 
-    if request.analysis_type in (AnalysisType.STR, AnalysisType.BOTH):
-        # 1. Try to get nearest comps (within 0.5km) from Supabase
-        str_comps = await supabase.get_nearest_airbnb_comps(
-            lat=property_details.latitude,
-            lng=property_details.longitude,
-            bedrooms=property_details.bedrooms,
-            limit=10
-        )
-
-        # Check age of comps
-        comps_fresh = False
-        if str_comps and all('last_updated' in comp and comp['last_updated'] for comp in str_comps):
-            from datetime import datetime, timezone, timedelta
-            now = datetime.now(timezone.utc)
-            fresh_threshold = now - timedelta(days=7)
-            # If every returned comp is recent, treat as fresh
-            comps_fresh = all(
-                datetime.fromisoformat(comp['last_updated']) >= fresh_threshold
-                for comp in str_comps
-            )
-
-        if str_comps and comps_fresh:
-            use_baseline = False
-            # Use comp data to estimate nightly rate and occupancy, then STR analysis
-            avg_nightly = sum([c["avg_nightly"] for c in str_comps if "avg_nightly" in c and c["avg_nightly"]]) / len(str_comps)
-            avg_occupancy = sum([c["occupancy"] for c in str_comps if "occupancy" in c and c["occupancy"] is not None]) / len(str_comps)
-            str_analysis = calculator.calculate_str(
-                property=property_details,
-                mortgage=mortgage,
-                nightly_rate=nightly_rate if request.nightly_rate_override else round(avg_nightly, 2),
-                occupancy=avg_occupancy,
-            )
-        else:
-            # Legacy/baseline calculation (no fresh comps available)
-            str_analysis = calculator.calculate_str(
-                property=property_details,
-                mortgage=mortgage,
-                nightly_rate=nightly_rate,
-                occupancy=0.68,  # Typical baseline occupancy — could be configurable
-            )
-            # 2. Trigger re-analysis in background for future fresh lookup
-            if property_details.latitude and property_details.longitude:
-                background_tasks.add_task(
-                    supabase.trigger_edge_fn_analyze_str_v2,
-                    lat=property_details.latitude,
-                    lng=property_details.longitude,
-                    bedrooms=property_details.bedrooms,
-                )
-
-    # ── Step 6: Compose response and cache ──────────────────────────
-    response = AnalyzeListingResponse(
+    return AnalyzeListingResponse(
         property=property_details,
-        mortgage=mortgage,
-        rent=rent_insight,
-        ltr=ltr_analysis,
-        str=str_analysis,
-    )
-    cache.set(*cache_key, response)
-    return response
-
-    # ── Step 1: Fetch listing from DDF ──────────────────────────────
-    raw_listing = await ddf_service.get_listing_by_mls(request.mls_number)
-
-    if not raw_listing:
-        raise HTTPException(
-            status_code=404,
-            detail=f"MLS® {request.mls_number} not found in DDF feed. "
-                   f"Verify the listing is active and accessible via your DDF credentials.",
-        )
-
-    property_details = ddf_service.parse_property_details(raw_listing)
-
-    # Allow price override (user negotiating below list)
-    if request.purchase_price_override:
-        property_details.list_price = request.purchase_price_override
-
-    # ── Step 2: Mortgage ────────────────────────────────────────────
-    mortgage = calculator.calculate_mortgage(
-        purchase_price=property_details.list_price,
-        interest_rate=request.interest_rate,
-        down_payment_pct=request.down_payment_pct,
-        amortization_years=request.amortization_years,
-    )
-
-    # ── Step 3: Rent Estimates ──────────────────────────────────────
-    rent_insight = rent_service.get_rent_estimate(
-        community=property_details.community,
-        bedrooms=property_details.bedrooms,
-        property_type=property_details.property_type,
-        square_footage=property_details.square_footage,
-    )
-    monthly_rent = request.monthly_rent_override or rent_insight.avg_rent
-
-    # STR nightly rate estimate: monthly / 30 * premium multiplier
-    # STR typically earns 1.5-2x LTR on revenue basis when occupied
-    nightly_rate = request.nightly_rate_override or round((monthly_rent / 30) * 2.1, 2)
-
-    # ── Step 4: LTR Analysis ────────────────────────────────────────
-    ltr_analysis = None
-    if request.analysis_type in (AnalysisType.LTR, AnalysisType.BOTH):
-        ltr_analysis = calculator.calculate_ltr(
-            property=property_details,
-            mortgage=mortgage,
-            monthly_rent=monthly_rent,
-        )
-
-    # ── Step 5: STR Analysis ────────────────────────────────────────
-    str_analysis = None
-    if request.analysis_type in (AnalysisType.STR, AnalysisType.BOTH):
-        # Get STR estimate + nearby comps
-        str_estimate = str_comp_service.get_str_estimate(
-            community=property_details.community,
-            bedrooms=property_details.bedrooms,
-            property_type=property_details.property_type,
-        )
-        nearby_airbnbs = str_comp_service.get_mock_nearby_comps(
-            community=property_details.community,
-            bedrooms=property_details.bedrooms,
-        )
-
-        effective_nightly = request.nightly_rate_override or str_estimate["estimated_nightly_rate"]
-        effective_occ = str_estimate["estimated_occupancy_rate"]
-
-        str_analysis = calculator.calculate_str(
-            property=property_details,
-            mortgage=mortgage,
-            nightly_rate=effective_nightly,
-            occupancy_rate=effective_occ,
-            nearby_airbnbs=nearby_airbnbs,
-        )
-
-    # ── Step 6: Investment Summary ──────────────────────────────────
-    summary = calculator.generate_summary(
-        ltr=ltr_analysis,
         str_analysis=str_analysis,
-        analysis_type=request.analysis_type,
+        # ...rest of your response fields as needed (return what your frontend requires)
     )
-
-    # ── Step 7: Log to Supabase (non-blocking) ──────────────────────
-    background_tasks.add_task(
-        supabase.log_analysis,
-        mls_number=request.mls_number,
-        analysis_type=request.analysis_type,
-        result_summary={
-            "cap_rate_ltr": ltr_analysis.cap_rate if ltr_analysis else None,
-            "cap_rate_str": str_analysis.cap_rate if str_analysis else None,
-            "coc_ltr": ltr_analysis.cash_on_cash_return if ltr_analysis else None,
-            "coc_str": str_analysis.cash_on_cash_return if str_analysis else None,
-            "recommendation": summary.recommendation,
-            "best_strategy": summary.best_strategy,
-            "purchase_price": property_details.list_price,
-            "community": property_details.community,
-        },
-    )
-
-    result = AnalyzeListingResponse(
-        property=property_details,
-        mortgage=mortgage,
-        ltr=ltr_analysis,
-        str_analysis=str_analysis,
-        summary=summary,
-    )
-
-    # Cache for 1 hour (DDF listings don't change that fast)
-    cache.set(*cache_key, value=result, ttl_seconds=3600)
-
-    return result
 
 
 @router.post("/quick-calc")
